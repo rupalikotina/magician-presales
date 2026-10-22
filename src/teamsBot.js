@@ -6,18 +6,16 @@ const {
     CardFactory,
     TeamsInfo
 } = require('botbuilder');
-const axios = require('axios');
+const { postLoops } = require('./internal/loopsClient');
+const { logger, elapsedMs } = require('./internal/logger');
+const { sendTeamsActivity, updateTeamsActivity, logConnectorError } = require('./internal/teamsResponse');
+const { noteActivity } = require('./internal/duplicateDetector');
 
 // Constants
 const BACKEND_URL = 'https://api.presalestest.theloops.ai/conversation/v1/webhooks/msteams/events';
 
-function messageTextWithoutMentions(activity) {
-    const raw = activity && activity.text ? String(activity.text) : '';
-    return raw.replace(/<at>[\s\S]*?<\/at>/gi, ' ').replace(/\s+/g, ' ').trim();
-}
-
 // IN-MEMORY vote tracker, keyed by the card's activity id -> Map(aadObjectId -> {name, verb}).
-// This is QA/demo-only: it lives in this bot process's memory, so it resets on restart and
+// This is concept/demo-only: it lives in this bot process's memory, so it resets on restart and
 // won't be shared across multiple bot instances if this ever scales out horizontally. It also
 // isn't visible to core/integrations for reporting. Once TLDV-3367's backend processing of
 // "MessageFeedback" events exists, this aggregation should move there (bot would fetch the
@@ -75,15 +73,34 @@ class TeamsBot extends TeamsActivityHandler {
         // Event handler for when a new message is received.
         this.onMessage(async (context, next) => {
             try {
+                try {
+                    noteActivity(context && context.activity, { suppress: false });
+                } catch (error) {
+                    logger.error("Duplicate observation failed", {
+                        event: "TEAMS_ACTIVITY_FAILED",
+                        error,
+                    });
+                }
 
                 // Guard: let TeamsFx ConversationBot handle 'loops'/'ask' commands; skip generic handlers to avoid duplicates.
-                // Strip the @mention first. The bot display name contains "Loops", so searching the raw
-                // text for that word treated every mention as a loops command and skipped the backend call.
-                const commandText = messageTextWithoutMentions(context.activity);
-                console.log("Received message:", commandText || "(no text)");
-                if (/^(loops|ask)\b/i.test(commandText)) {
-                    await next();
-                    return;
+                try {
+                    const raw = (context && context.activity && context.activity.text) ? String(context.activity.text) : '';
+                    const text = raw.trim();
+                    if (/^(loops|ask)\b/i.test(text)) {
+                        logger.info("Delegating message to command handler", {
+                            event: "TEAMS_ACTIVITY_CLASSIFIED",
+                            actionType: "Command",
+                            text,
+                            activityId: context.activity && context.activity.id,
+                        });
+                        await next();
+                        return; // do not continue to generic notifier paths
+                    }
+                } catch (e) {
+                    logger.error("command guard failed", {
+                        event: "TEAMS_ACTIVITY_FAILED",
+                        error: e,
+                    });
                 }
 
                 if (context.activity) {
@@ -91,18 +108,52 @@ class TeamsBot extends TeamsActivityHandler {
                     const formData = context.activity.value;
 
                     if (context.activity && context.activity.text) {
+                        const text = context.activity.text.trim().toLowerCase();
+                        logger.info("Received message", {
+                            event: "TEAMS_ACTIVITY_RECEIVED",
+                            activityType: context.activity.type,
+                            text,
+                            activityId: context.activity.id,
+                        });
+
                         // Check if the message is in a personal chat
                         if (context.activity.conversation.conversationType === "personal") {
+                            logger.info("Classified personal message", {
+                                event: "TEAMS_ACTIVITY_CLASSIFIED",
+                                actionType: "UserInteractionWithBot",
+                                text,
+                                activityId: context.activity.id,
+                                conversation: context.activity.conversation,
+                            });
                             // Notify the backend that a new message was received in a direct chat with the bot.
                             await notifyBackendForNewMessage('UserInteractionWithBot', context);
                         } else {
                             // Check if the message mentions the bot.
-                            const entities = context.activity.entities || [];
-                            const isBotMentioned = entities.some(entity => entity.type === 'mention' && entity.mentioned && entity.mentioned.id === context.activity.recipient.id);
+                            const isBotMentioned = context.activity.entities.some(entity => entity.type === 'mention' && entity.mentioned.id === context.activity.recipient.id);
 
                             // Determine the appropriate action based on the message content.
                             if (isBotMentioned) {
-                                await notifyBackendForNewMessage('LoopsBotMentioned', context);
+                                const words = text.split(' ');
+                                const loopsIndex = words.indexOf("loops");
+
+                                if (loopsIndex === -1) {
+                                    // Notify the backend that a new message was received.
+                                    const actionType = 'LoopsBotMentioned';
+                                    logger.info("Classified bot mention", {
+                                        event: "TEAMS_ACTIVITY_CLASSIFIED",
+                                        actionType,
+                                        text,
+                                        activityId: context.activity.id,
+                                    });
+                                    await notifyBackendForNewMessage(actionType, context);
+                                } else {
+                                    logger.info("Bot mention left to command handler", {
+                                        event: "TEAMS_ACTIVITY_CLASSIFIED",
+                                        actionType: "Command",
+                                        text,
+                                        activityId: context.activity.id,
+                                    });
+                                }
                             } else {
                                 // If the bot is not mentioned, still notify the backend about the new message.
                                 const conversationId = context.activity.conversation.id;
@@ -110,6 +161,13 @@ class TeamsBot extends TeamsActivityHandler {
 
                                 const messageIdMatch = conversationId.match(/messageid=(\d+)/);
                                 const actionType = ((messageIdMatch && messageIdMatch[1]) && messageIdMatch[1] !== activityId) ? 'NewThreadedMessage' : 'NewMessage';
+                                logger.info("Classified channel message", {
+                                    event: "TEAMS_ACTIVITY_CLASSIFIED",
+                                    actionType,
+                                    text,
+                                    activityId,
+                                    conversationId,
+                                });
                                 await notifyBackendForNewMessage(actionType, context);
                             }
                         }
@@ -117,10 +175,23 @@ class TeamsBot extends TeamsActivityHandler {
                     } else if (formData) {
                         try {
                             if (formData.verb === 'like' || formData.verb === 'dislike') {
+                                logger.info("Classified card feedback", {
+                                    event: "TEAMS_ACTIVITY_CLASSIFIED",
+                                    actionType: "MessageFeedback",
+                                    verb: formData.verb,
+                                    formData,
+                                    activityId: context.activity.id,
+                                });
                                 // Like/dislike tap arriving as an Action.Submit (activity.value).
                                 await handleCardFeedback(context, formData);
                             } else if (formData.dropdownChanged) {
                                 const actionType = 'UpdateAdaptiveCardOnDropDown';
+                                logger.info("Activity classified", {
+                                    event: "TEAMS_ACTIVITY_CLASSIFIED",
+                                    actionType,
+                                    formData,
+                                    activityId: context.activity.id,
+                                });
                                 const dropdownValue = cardInput.dropdown;
 
                                 // Create the payload
@@ -131,11 +202,17 @@ class TeamsBot extends TeamsActivityHandler {
 
                                 // Update the card based on the dropdownValue
                                 const updatedCard = await generateUpdatedCard(payload);
-                                await context.updateActivity({
+                                await updateTeamsActivity(context, {
                                     attachments: [updatedCard]
                                 });
                             } else {
                                 const actionType = 'ProcessAdaptiveCardForm';
+                                logger.info("Activity classified", {
+                                    event: "TEAMS_ACTIVITY_CLASSIFIED",
+                                    actionType,
+                                    formData,
+                                    activityId: context.activity.id,
+                                });
                                 // Create the payload
                                 const payload = {
                                     ...await constructPayloadForBackend(actionType, formData, context),
@@ -156,19 +233,25 @@ class TeamsBot extends TeamsActivityHandler {
                                 const responseAsReply = buttonData.responseAsReply || false;
 
                                 const payloadJsonString = JSON.stringify(payload);
-                                const response = await axios.post(BACKEND_URL, payloadJsonString);
+                                const response = await postLoops(BACKEND_URL, payloadJsonString);
                                 await processBackendResponse(response, context, responseAsReply);
                             }
                         } catch (error) {
-                            console.error('Error in onMessage:', error);
-                            await context.updateActivity(error.message);
+                            logger.error("Error in onMessage", {
+                                event: "TEAMS_ACTIVITY_FAILED",
+                                error,
+                            });
+                            await updateTeamsActivity(context, error.message);
                         }
                     }
                 }
 
             } catch (error) {
-                console.error('Error in onMessage:', error);
-                await context.sendActivity(error.message);
+                logger.error("Error in onMessage", {
+                    event: "TEAMS_ACTIVITY_FAILED",
+                    error,
+                });
+                await sendTeamsActivity(context, error.message);
             }
         });
 
@@ -177,17 +260,36 @@ class TeamsBot extends TeamsActivityHandler {
         // Event handler for when a new channel is created.
         this.onConversationUpdate(async (context, next) => {
             try {
+                try {
+                    noteActivity(context && context.activity, { suppress: false });
+                } catch (error) {
+                    logger.error("Duplicate observation failed", {
+                        event: "TEAMS_ACTIVITY_FAILED",
+                        error,
+                    });
+                }
 
-                const eventType = context.activity.channelData && context.activity.channelData.eventType;
-                if (eventType == "teamMemberAdded") {
+                logger.info("Conversation update received", {
+                    event: "TEAMS_ACTIVITY_RECEIVED",
+                    activityType: context.activity.type,
+                    eventType: context.activity.channelData && context.activity.channelData.eventType,
+                    activityId: context.activity.id,
+                    membersAdded: context.activity.membersAdded,
+                    membersRemoved: context.activity.membersRemoved,
+                    channelData: context.activity.channelData,
+                });
+                if (context.activity.channelData.eventType == "teamMemberAdded") {
                     await handleTeamMembersAdded(context);
-                } else if (eventType == "teamMemberRemoved") {
+                } else if (context.activity.channelData.eventType == "teamMemberRemoved") {
                     await handleTeamMembersRemoved(context);
                 }
 
                 await next();
             } catch (error) {
-                console.error('Error in onConversationUpdate:', error);
+                logger.error("Error in onConversationUpdate", {
+                    event: "TEAMS_ACTIVITY_FAILED",
+                    error,
+                });
             }
         });
 
@@ -212,17 +314,41 @@ class TeamsBot extends TeamsActivityHandler {
      * InvokeResponse instead of using context.sendActivity(...).
      */
     async onInvokeActivity(context) {
+        try {
+            noteActivity(context && context.activity, { suppress: false });
+        } catch (error) {
+            logger.error("Duplicate observation failed", {
+                event: "TEAMS_ACTIVITY_FAILED",
+                error,
+            });
+        }
         if (context.activity.name === 'adaptiveCard/action') {
             try {
                 const invokeValue = context.activity.value; // { action: { type, id, verb, data } }
                 const verb = invokeValue && invokeValue.action ? invokeValue.action.verb : undefined;
                 const actionData = invokeValue && invokeValue.action ? invokeValue.action.data : undefined;
 
+                logger.info("Adaptive card invoke received", {
+                    event: "TEAMS_ACTIVITY_RECEIVED",
+                    activityType: context.activity.type,
+                    verb,
+                    actionData,
+                    activityId: context.activity.id,
+                    from: context.activity.from,
+                    conversation: context.activity.conversation,
+                });
+                logger.info("Activity classified", {
+                    event: "TEAMS_ACTIVITY_CLASSIFIED",
+                    actionType: verb || context.activity.name,
+                    verb,
+                    actionData,
+                    activityId: context.activity.id,
+                });
                 switch (verb) {
                     case 'like':
                     case 'dislike': {
                         // Call the backend directly, synchronously, as part of handling the tap.
-                        await axios.post(BACKEND_URL, {
+                        const feedbackBody = {
                             action: 'MessageFeedback',
                             feedback: verb,
                             data: actionData,
@@ -230,7 +356,8 @@ class TeamsBot extends TeamsActivityHandler {
                             to: context.activity.recipient,
                             eventId: context.activity.id,
                             eventTimestamp: context.activity.timestamp
-                        }, { headers: { 'Content-Type': 'application/json' } });
+                        };
+                        await postLoops(BACKEND_URL, feedbackBody, { headers: { 'Content-Type': 'application/json' } });
 
                         return {
                             status: 200,
@@ -254,11 +381,18 @@ class TeamsBot extends TeamsActivityHandler {
                         await this.handleCardSubmitAction(context, actionData);
                         return { status: 200, body: { statusCode: 200 } };
                     default:
-                        console.error('Unknown adaptiveCard/action verb:', verb);
+                        logger.error("Unknown adaptiveCard/action verb", {
+                            event: "TEAMS_ACTIVITY_FAILED",
+                            verb,
+                            activityId: context.activity.id,
+                        });
                         return { status: 200, body: { statusCode: 400, type: 'application/vnd.microsoft.error', value: { code: 'UnknownVerb', message: `Unknown action verb: ${verb}` } } };
                 }
             } catch (error) {
-                console.error('Error handling adaptiveCard/action invoke:', error);
+                logger.error("Error handling adaptiveCard/action invoke", {
+                    event: "TEAMS_ACTIVITY_FAILED",
+                    error,
+                });
                 return { status: 500, body: { statusCode: 500, type: 'application/vnd.microsoft.error', value: { code: 'InternalError', message: error.message } } };
             }
         }
@@ -272,10 +406,14 @@ class TeamsBot extends TeamsActivityHandler {
     async handleCardSubmitAction(context, actionData) {
         // Process actionData here (e.g., save to database, call an API, etc.)
         // For now, let's log the data
-        console.log('Received submit action data:', actionData);
+        logger.info("Received submit action data", {
+            event: "TEAMS_CARD_SUBMITTED",
+            actionData,
+            activityId: context.activity.id,
+        });
 
         // Optionally send a response message to the user
-        await context.sendActivity('Your form data was received and processed.');
+        await sendTeamsActivity(context, 'Your form data was received and processed.');
     }
 
 }
@@ -302,18 +440,23 @@ async function notifyBackendForNewMessage(actionType, context) {
         isBotMentioned: isBotMentioned
     };
     const payloadJsonString = JSON.stringify(payload);
-    console.log(payload)
 
     try {
         // Sending a POST request to the backend with the constructed payload.
-        await axios.post(BACKEND_URL, payloadJsonString, {
+        // postLoops logs start, acceptance, and failure without changing this error.
+        await postLoops(BACKEND_URL, payloadJsonString, {
             headers: {
                 'Content-Type': 'application/json'
             }
         });
     } catch (error) {
-        // Log the error if the backend notification fails.
-        console.error(`Error notifying backend for ${actionType}:`, error);
+        // Swallow so a webhook failure does not fail the Teams turn. postLoops already logged it.
+        logger.error(`Error notifying backend for ${actionType}`, {
+            event: "TEAMS_ACTIVITY_FAILED",
+            actionType,
+            durationMs: elapsedMs(),
+            error,
+        });
     }
 }
 
@@ -343,8 +486,13 @@ async function handleCardFeedback(context, formData) {
     // by. Do not fall back to formData.messageId: that value comes from whatever the card's
     // own JSON had baked into its selectAction.data, which in our test cards is still the
     // literal unsubstituted string "${messageId}" - not a real activity id.
-    console.log('handleCardFeedback: verb=%s, activity.id=%s, activity.replyToId=%s, conversationId=%s',
-        verb, context.activity.id, context.activity.replyToId, context.activity.conversation && context.activity.conversation.id);
+    logger.info("handleCardFeedback", {
+        event: "TEAMS_ACTIVITY_RECEIVED",
+        verb,
+        activityId: context.activity.id,
+        replyToId: context.activity.replyToId,
+        conversationId: context.activity.conversation && context.activity.conversation.id,
+    });
 
     // Prefer replyToId (the Bot Framework-correct answer to "which message was this card
     // on"), but fall back to formData.cardActivityId - a field the SENDER is responsible
@@ -356,9 +504,14 @@ async function handleCardFeedback(context, formData) {
     // the response, then re-send with updateMode:true and cardActivityId set to that id.
     const originalActivityId = context.activity.replyToId || formData.cardActivityId;
     if (!originalActivityId) {
-        console.error('handleCardFeedback: no replyToId AND no formData.cardActivityId - cannot record or ' +
-            'update the original card. Either Teams did not tell us which message the tap came from, or the ' +
-            'card was never re-sent with its own real activity id baked into cardActivityId after the initial send.');
+        logger.error("handleCardFeedback: no replyToId AND no formData.cardActivityId - cannot record or update the original card", {
+            event: "TEAMS_RESPONSE_FAILED",
+            verb,
+            activityId: context.activity.id,
+            replyToId: context.activity.replyToId,
+            conversationId: context.activity.conversation && context.activity.conversation.id,
+            formData,
+        });
         return;
     }
 
@@ -379,7 +532,7 @@ async function handleCardFeedback(context, formData) {
         // whatever gets added later) still travels opaquely inside `data` - teamsBot.js
         // still doesn't need to know or enumerate the card's schema.
         const backendPayload = await constructPayloadForBackend('MessageFeedback', formData, context);
-        await axios.post(BACKEND_URL, {
+        const feedbackPayload = {
             ...backendPayload,
             feedback: verb,
             undone: voteSummary.undone, // true = user removed their own vote, not added/changed it
@@ -387,9 +540,14 @@ async function handleCardFeedback(context, formData) {
             to: context.activity.recipient,
             eventId: context.activity.id,
             eventTimestamp: context.activity.timestamp
-        }, { headers: { 'Content-Type': 'application/json' } });
+        };
+        await postLoops(BACKEND_URL, feedbackPayload, { headers: { 'Content-Type': 'application/json' } });
     } catch (error) {
-        console.error('Failed to record message feedback in backend:', error);
+        logger.error("Failed to record message feedback in backend", {
+            event: "TEAMS_ACTIVITY_FAILED",
+            durationMs: elapsedMs(),
+            error,
+        });
     }
 
     // Rebuild the SAME card, still fully interactive, re-highlighted purely from the
@@ -400,21 +558,14 @@ async function handleCardFeedback(context, formData) {
     const resultCard = buildFeedbackCard(formData, voteSummary);
 
     try {
-        const updateResp = await context.updateActivity({
+        await updateTeamsActivity(context, {
             type: 'message',
             id: originalActivityId,
             attachments: [CardFactory.adaptiveCard(resultCard)]
         });
-        console.log('handleCardFeedback: updateActivity succeeded for id=%s, response=%o', originalActivityId, updateResp);
-    } catch (error) {
-        // Log the full error shape (status + body), not just the Error object, so the
-        // actual reason (404 activity not found, 403 auth, etc.) is visible in the logs.
-        console.error('handleCardFeedback: updateActivity FAILED for id=%s. status=%s body=%o message=%s',
-            originalActivityId,
-            error && error.response && error.response.status,
-            error && error.response && (error.response.data || error.response.body),
-            error && error.message,
-            error);
+    } catch (_error) {
+        // updateTeamsActivity already logged TEAMS_RESPONSE_FAILED or TEAMS_AUTH_FAILED
+        // with status and body. Swallow so a card rewrite failure does not undo the vote.
     }
 }
 
@@ -537,11 +688,11 @@ async function constructPayloadForBackend(actionType, data, context) {
     if (teamId) {
         try {
             // Fetch team details using the teamId.
-            const teamDetails = await TeamsInfo.getTeamDetails(context);
+            const teamDetails = await TeamsInfo.getTeamDetails(context, teamId);
             teamName = teamDetails.name;
             teamId = teamDetails.aadGroupId;
         } catch (err) {
-            console.error("Error fetching team details:", err);
+            logConnectorError("Error fetching team details", err);
             teamName = "Unknown"; // Or any other default value.
         }
     } else {
@@ -582,16 +733,23 @@ async function handleTeamMembersAdded(context) {
 
                 // Define an action to fetch the welcome message for the bot.
                 let actionType = 'FetchWelcomeMessage';
+                logger.info("Activity classified", {
+                    event: "TEAMS_ACTIVITY_CLASSIFIED",
+                    actionType,
+                    activityType: context.activity.type,
+                    memberId: member.id,
+                    activityId: context.activity.id,
+                });
                 let teamId = context.activity.channelData.team ? context.activity.channelData.team.id : undefined;
 
                 if (teamId) {
                     try {
                         // Fetch team details using the teamId.
-                        const teamDetails = await TeamsInfo.getTeamDetails(context);
+                        const teamDetails = await TeamsInfo.getTeamDetails(context, teamId);
                         teamName = teamDetails.name;
                         teamId = teamDetails.aadGroupId;
                     } catch (err) {
-                        console.error("Error fetching team details:", err);
+                        logConnectorError("Error fetching team details", err);
                         teamName = "Unknown"; // Or any other default value.
                     }
                 } else {
@@ -611,7 +769,7 @@ async function handleTeamMembersAdded(context) {
 
                 // Attempt to fetch the welcome message for the bot from the backend.
                 try {
-                    const welcomeResponse = await axios.post(BACKEND_URL, payloadJsonString, {
+                    const welcomeResponse = await postLoops(BACKEND_URL, payloadJsonString, {
                         headers: {
                             'Content-Type': 'application/json'
                         }
@@ -629,20 +787,25 @@ async function handleTeamMembersAdded(context) {
                         text: `<at>${botName}</at>`,
                         type: 'mention'
                     }];
-                    await context.sendActivity(message);
+                    await sendTeamsActivity(context, message);
 
                     // Notify the backend about the addition of the bot to a team or channel.
                     actionType = 'NotifyBotAddition';
+                    logger.info("Activity classified", {
+                        event: "TEAMS_ACTIVITY_CLASSIFIED",
+                        actionType,
+                        activityId: context.activity.id,
+                    });
                     let teamId = context.activity.channelData.team ? context.activity.channelData.team.aadGroupId : undefined;
 
                     if (teamId) {
                         try {
                             // Fetch team details using the teamId.
-                            const teamDetails = await TeamsInfo.getTeamDetails(context);
+                            const teamDetails = await TeamsInfo.getTeamDetails(context, teamId);
                             teamName = teamDetails.name;
                             teamId = teamDetails.aadGroupId;
                         } catch (err) {
-                            console.error("Error fetching team details:", err);
+                            logConnectorError("Error fetching team details", err);
                             teamName = "Unknown"; // Or any other default value.
                         }
                     } else {
@@ -660,7 +823,7 @@ async function handleTeamMembersAdded(context) {
                     };
 
                     const notifyPayloadJsonString = JSON.stringify(notifyPayload);
-                    await axios.post(BACKEND_URL, notifyPayloadJsonString, {
+                    await postLoops(BACKEND_URL, notifyPayloadJsonString, {
                         headers: {
                             'Content-Type': 'application/json'
                         }
@@ -668,24 +831,35 @@ async function handleTeamMembersAdded(context) {
 
                 } catch (error) {
                     // If there's an error fetching the welcome message, log it and send a default message.
-                    console.error("Error fetching welcome message from backend:", error);
+                    // postLoops already recorded LOOPS_WEBHOOK_FAILED for the HTTP call.
+                    logger.error("Error fetching welcome message from backend", {
+                        event: "TEAMS_ACTIVITY_FAILED",
+                        durationMs: elapsedMs(),
+                        error,
+                    });
                     if (defaultMessage) {
-                        await context.sendActivity(defaultMessage);
+                        await sendTeamsActivity(context, defaultMessage);
                     }
                 }
             } else {
                 // For members other than the bot.
                 const actionType = 'MemberJoinedChannel';
+                logger.info("Activity classified", {
+                    event: "TEAMS_ACTIVITY_CLASSIFIED",
+                    actionType,
+                    userId: member.aadObjectId,
+                    activityId: context.activity.id,
+                });
                 let teamId = context.activity.channelData.team ? context.activity.channelData.team.aadGroupId : undefined;
 
                 if (teamId) {
                     try {
                         // Fetch team details using the teamId.
-                        const teamDetails = await TeamsInfo.getTeamDetails(context);
+                        const teamDetails = await TeamsInfo.getTeamDetails(context, teamId);
                         teamName = teamDetails.name;
                         teamId = teamDetails.aadGroupId;
                     } catch (err) {
-                        console.error("Error fetching team details:", err);
+                        logConnectorError("Error fetching team details", err);
                         teamName = "Unknown"; // Or any other default value.
                     }
                 } else {
@@ -705,7 +879,7 @@ async function handleTeamMembersAdded(context) {
                 const payloadJsonString = JSON.stringify(payload);
 
                 // Notify the backend about the addition of a member to a team or channel.
-                await axios.post(BACKEND_URL, payloadJsonString, {
+                await postLoops(BACKEND_URL, payloadJsonString, {
                     headers: {
                         'Content-Type': 'application/json'
                     }
@@ -713,7 +887,7 @@ async function handleTeamMembersAdded(context) {
             }
         }
     } catch (error) {
-        console.error('Error in onMembersAdded:', error);
+        logger.error("Error in onMembersAdded", { event: "TEAMS_ACTIVITY_FAILED", error });
     }
 }
 
@@ -737,20 +911,25 @@ async function handleTeamMembersRemoved(context) {
 
                 // Craft a message indicating the bot was removed and by whom, then send it.
                 const removalMessage = `<at>${botName}</at> was removed from ${teamName} by <at>${removerName}</at>.`;
-                await context.sendActivity(removalMessage);
+                await sendTeamsActivity(context, removalMessage);
 
                 // Notify the backend about the removal of the bot to a team or channel.
                 actionType = 'NotifyBotRemoval';
+                logger.info("Activity classified", {
+                    event: "TEAMS_ACTIVITY_CLASSIFIED",
+                    actionType,
+                    activityId: context.activity.id,
+                });
                 let teamId = context.activity.channelData.team ? context.activity.channelData.team.aadGroupId : undefined;
 
                 if (teamId) {
                     try {
                         // Fetch team details using the teamId.
-                        const teamDetails = await TeamsInfo.getTeamDetails(context);
+                        const teamDetails = await TeamsInfo.getTeamDetails(context, teamId);
                         teamName = teamDetails.name;
                         teamId = teamDetails.aadGroupId;
                     } catch (err) {
-                        console.error("Error fetching team details:", err);
+                        logConnectorError("Error fetching team details", err);
                         teamName = "Unknown"; // Or any other default value.
                     }
                 } else {
@@ -767,7 +946,7 @@ async function handleTeamMembersRemoved(context) {
                 };
 
                 const notifyPayloadJsonString = JSON.stringify(notifyPayload);
-                await axios.post(BACKEND_URL, notifyPayloadJsonString, {
+                await postLoops(BACKEND_URL, notifyPayloadJsonString, {
                     headers: {
                         'Content-Type': 'application/json'
                     }
@@ -775,16 +954,22 @@ async function handleTeamMembersRemoved(context) {
             } else {
                 // For members other than the bot.
                 const actionType = 'MemberLeftChannel';
+                logger.info("Activity classified", {
+                    event: "TEAMS_ACTIVITY_CLASSIFIED",
+                    actionType,
+                    userId: member.aadObjectId,
+                    activityId: context.activity.id,
+                });
                 let teamId = context.activity.channelData.team ? context.activity.channelData.team.id : undefined;
 
                 if (teamId) {
                     try {
                         // Fetch team details using the teamId.
-                        const teamDetails = await TeamsInfo.getTeamDetails(context);
+                        const teamDetails = await TeamsInfo.getTeamDetails(context, teamId);
                         teamName = teamDetails.name;
                         teamId = teamDetails.aadGroupId;
                     } catch (err) {
-                        console.error("Error fetching team details:", err);
+                        logConnectorError("Error fetching team details", err);
                         teamName = "Unknown"; // Or any other default value.
                     }
                 } else {
@@ -804,7 +989,7 @@ async function handleTeamMembersRemoved(context) {
                 const payloadJsonString = JSON.stringify(payload);
 
                 // Notify the backend about the removal of a member from a team or channel.
-                await axios.post(BACKEND_URL, payloadJsonString, {
+                await postLoops(BACKEND_URL, payloadJsonString, {
                     headers: {
                         'Content-Type': 'application/json'
                     }
@@ -812,7 +997,7 @@ async function handleTeamMembersRemoved(context) {
             }
         }
     } catch (error) {
-        console.error('Error in onMembersRemoved:', error);
+        logger.error("Error in onMembersRemoved", { event: "TEAMS_ACTIVITY_FAILED", error });
     }
 }
 
@@ -830,11 +1015,11 @@ async function handleTeamsChannelCreated(context) {
         if (teamId) {
             try {
                 // Fetch team details using the teamId.
-                const teamDetails = await TeamsInfo.getTeamDetails(context);
+                const teamDetails = await TeamsInfo.getTeamDetails(context, teamId);
                 teamName = teamDetails.name;
                 teamId = teamDetails.aadGroupId;
             } catch (err) {
-                console.error("Error fetching team details:", err);
+                logConnectorError("Error fetching team details", err);
                 teamName = "Unknown"; // Or any other default value.
             }
         } else {
@@ -843,6 +1028,12 @@ async function handleTeamsChannelCreated(context) {
 
         // Create the payload to send to the backend.
         const actionType = 'NotifyChannelCreation';
+        logger.info("Activity classified", {
+            event: "TEAMS_ACTIVITY_CLASSIFIED",
+            actionType,
+            channelId,
+            activityId: context.activity.id,
+        });
         const payload = {
             action: actionType,
             teamsTenantId: context.activity.channelData.tenant.id,
@@ -858,13 +1049,13 @@ async function handleTeamsChannelCreated(context) {
         const payloadJsonString = JSON.stringify(payload);
 
         // Send the payload to the backend.
-        await axios.post(BACKEND_URL, payloadJsonString, {
+        await postLoops(BACKEND_URL, payloadJsonString, {
             headers: {
                 'Content-Type': 'application/json'
             }
         });
     } catch (error) {
-        console.error('Error in onTeamsChannelCreated:', error);
+        logger.error("Error in onTeamsChannelCreated", { event: "TEAMS_ACTIVITY_FAILED", error });
     }
 }
 
@@ -879,7 +1070,12 @@ async function processBackendResponse(response, context, responseAsReply) {
     try {
         // Check if backend response indicates successful processing.
         if (response.data.status === "ok") {
-            console.log("Backend response:", response.data);
+            logger.info("Backend response", {
+                event: "LOOPS_WEBHOOK_SUCCEEDED",
+                processingStatus: "webhook_accepted",
+                durationMs: elapsedMs(),
+                response: response.data,
+            });
 
             // If there's card JSON data in the response, create an adaptive card.
             if (response.data && response.data.cardJson) {
@@ -888,13 +1084,13 @@ async function processBackendResponse(response, context, responseAsReply) {
                 // If action type is not for fetching input, display card.
                 if (response.data.actionType !== 'FetchInputAdaptiveCard') {
                     if (responseAsReply) {
-                        await context.sendActivity({
+                        await sendTeamsActivity(context, {
                             type: 'message',
                             id: context.activity.replyToId,
                             attachments: [card]
                         });
                     } else {
-                        await context.updateActivity({
+                        await updateTeamsActivity(context, {
                             type: 'message',
                             id: context.activity.replyToId,
                             attachments: [card]
@@ -905,13 +1101,13 @@ async function processBackendResponse(response, context, responseAsReply) {
             // If there's a message in the response, send it.
             else if (response.data && response.data.message) {
                 if (responseAsReply) {
-                    await context.sendActivity({
+                    await sendTeamsActivity(context, {
                         type: 'message',
                         id: context.activity.replyToId,
                         text: response.data.message
                     });
                 } else {
-                    await context.updateActivity({
+                    await updateTeamsActivity(context, {
                         type: 'message',
                         id: context.activity.replyToId,
                         text: response.data.message
@@ -921,10 +1117,17 @@ async function processBackendResponse(response, context, responseAsReply) {
         }
         // If backend response indicates an error, log it and inform the user.
         else {
+            logger.error("Backend response was not ok", {
+                event: "LOOPS_WEBHOOK_FAILED",
+                processingStatus: "webhook_failed",
+                durationMs: elapsedMs(),
+                response: response.data,
+                activityId: context.activity && context.activity.id,
+            });
             const defaultCardJson = getDefaultAdaptiveCard(response.data.cardJson);
             const card = CardFactory.adaptiveCard(defaultCardJson);
             if (responseAsReply) {
-                await context.sendActivity({
+                await sendTeamsActivity(context, {
                     type: 'message',
                     id: context.activity.replyToId,
                     attachments: [card],
@@ -948,7 +1151,7 @@ async function processBackendResponse(response, context, responseAsReply) {
                     }
                 });
             } else {
-                await context.updateActivity({
+                await updateTeamsActivity(context, {
                     type: 'message',
                     id: context.activity.replyToId,
                     attachments: [card],
@@ -974,8 +1177,12 @@ async function processBackendResponse(response, context, responseAsReply) {
             }
         }
     } catch (error) {
-        console.error('Error processing the backend response:', error);
-        await context.updateActivity({
+        logger.error("Error processing the backend response", {
+            event: "TEAMS_ACTIVITY_FAILED",
+            durationMs: elapsedMs(),
+            error,
+        });
+        await updateTeamsActivity(context, {
             type: 'message', // Activity type
             id: context.activity.replyToId, // ID of the activity to be updated
             text: 'An unexpected error occurred. Please try again later.' // New text to replace the previous message
@@ -992,7 +1199,15 @@ async function processBackendResponse(response, context, responseAsReply) {
 async function generateUpdatedCard(payload) {
     // Send the payload to your backend and wait for a response.
     const payloadJsonString = JSON.stringify(payload);
-    const response = await axios.post(YOUR_BACKEND_URL, payloadJsonString);
+    const response = await postLoops(YOUR_BACKEND_URL, payloadJsonString);
+    logger.info("Backend response", {
+        event: "LOOPS_WEBHOOK_SUCCEEDED",
+        processingStatus: "webhook_accepted",
+        durationMs: elapsedMs(),
+        actionType: payload && payload.action,
+        status: response.status,
+        response: response.data,
+    });
 
     // If the backend response is successful and contains card data, return the card.
     if (response.data.status === "ok" && response.data.cardJson) {

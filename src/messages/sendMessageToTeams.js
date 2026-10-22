@@ -1,6 +1,8 @@
 // src/messages/sendMessageToTeams.js
 const { MessageFactory } = require("botbuilder");
 const { AuthenticationConstants } = require("botframework-connector");
+const { logger, elapsedMs } = require("../internal/logger");
+const { sendTeamsActivity, updateTeamsActivity } = require("../internal/teamsResponse");
 
 /**
  * Ensure we have a ConversationReference-like object the adapter can use.
@@ -122,10 +124,10 @@ async function sendMessageToTeams(
     }
 
     if (updateMode && activityId) {
-      const updateResp = await context.updateActivity({ id: activityId, ...activity });
+      const updateResp = await updateTeamsActivity(context, { id: activityId, ...activity });
       result = { mode: "update", activityId, updateResp };
     } else {
-      const sendResp = await context.sendActivity(activity); // returns { id: '<activityId>' }
+      const sendResp = await sendTeamsActivity(context, activity); // returns { id: '<activityId>' }
       result = { mode: "send", activityId: sendResp?.id };
 
       // If the card carries a `cardActivityId` field anywhere in its action data (the
@@ -136,7 +138,7 @@ async function sendMessageToTeams(
       if (cardContent && sendResp?.id) {
         const embeddedCard = JSON.parse(JSON.stringify(cardContent));
         if (embedSelfActivityId(embeddedCard, sendResp.id)) {
-          await context.updateActivity({
+          await updateTeamsActivity(context, {
             id: sendResp.id,
             type: "message",
             attachments: [embeddedCard],
@@ -151,6 +153,7 @@ async function sendMessageToTeams(
     // Personal (1:1) chat: the real conversation id must be minted by Bot Framework via
     // createConversation() using {bot, user, conversation.tenantId}. Passing the raw AAD
     // user id as conversation.id (the old behavior) is invalid and causes the send to fail.
+    // CloudAdapter (UserAssignedMSI) requires createConversationAsync / continueConversationAsync.
     await adapter.createConversationAsync(
       appId,
       ref.channelId,
@@ -169,13 +172,23 @@ async function sendMessageToTeams(
     await adapter.continueConversationAsync(appId, ref, runTurn);
   }
 
-  return {
+  const details = {
     ok: true,
     ...result,
     serviceUrl: ref.serviceUrl,
     threadId: ref.conversation.id,
     tenantId: ref.conversation.tenantId,
   };
+  logger.info("Teams message sent", {
+    event: "TEAMS_RESPONSE_SUCCEEDED",
+    durationMs: elapsedMs(),
+    isUser: Boolean(isUser),
+    updateMode: Boolean(updateMode),
+    messageText,
+    cardContent,
+    details,
+  });
+  return details;
 }
 
 module.exports = { sendMessageToTeams };

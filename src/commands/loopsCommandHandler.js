@@ -11,24 +11,13 @@ const {
 const {
   InvokeResponseFactory
 } = require("@microsoft/teamsfx");
-const axios = require('axios'); // Import axios for making HTTP requests (assuming it's already imported elsewhere);
+const { postLoops } = require('../internal/loopsClient');
+const { logger, elapsedMs } = require('../internal/logger');
+const { sendTeamsActivity, updateTeamsActivity, logConnectorError } = require('../internal/teamsResponse');
+const { noteActivity } = require('../internal/duplicateDetector');
 
 // Constants
 const BACKEND_URL = 'https://api.presalestest.theloops.ai/conversation/v1/webhooks/msteams/events';
-
-// Simple in-memory idempotency guard for commands (suppresses duplicates within a short window)
-const __seenCommands = new Map(); // key -> timestamp
-const __SEEN_TTL_MS = 5 * 60 * 1000; // 5 minutes
-
-function __seenOnce(key) {
-    const now = Date.now();
-    for (const [k, t] of __seenCommands) {
-        if (now - t > __SEEN_TTL_MS) __seenCommands.delete(k);
-    }
-    if (__seenCommands.has(key)) return true;
-    __seenCommands.set(key, now);
-    return false;
-}
 
 class LoopsCommandHandler {
   constructor() {
@@ -41,22 +30,39 @@ class LoopsCommandHandler {
    * Handles the reception of a "loops" command.
    */
   async handleCommandReceived(context, message) {
-      // Idempotency: suppress duplicate invocations for the same activity
+    // Idempotency: suppress duplicate invocations for the same activity.
+    // A missing activity id is not a key, so unrelated commands are not collapsed.
       try {
-          const key = `${context?.activity?.id || ''}:${context?.activity?.conversation?.id || ''}`;
-          if (__seenOnce(key)) {
-              console.log('[dedupe] Suppressed duplicate handleCommandReceived for', key);
+          const observation = noteActivity(context && context.activity, {
+              suppress: true,
+              text: message && message.text,
+          });
+          if (observation.suppress) {
               return;
           }
       } catch (e) {
-          console.error('[dedupe] guard error', e);
+          logger.error("Duplicate guard error", {
+              event: "TEAMS_ACTIVITY_FAILED",
+              error: e,
+          });
       }
-
-      console.log(`App received command: ${message.text}`);
+      
+      logger.info("App received command", {
+          event: "TEAMS_ACTIVITY_RECEIVED",
+          activityType: context.activity && context.activity.type,
+          text: message.text,
+          activityId: context.activity && context.activity.id,
+      });
 
       // Extract the argument text after the "loops" command.
       const command = message.matches ? message.matches[1].trim() : '';
       const commandText = (message.matches && message.matches[3]) ? message.matches[3].trim() : '';
+      logger.info("Activity classified", {
+          event: "TEAMS_ACTIVITY_CLASSIFIED",
+          actionType: command || "loops",
+          text: message.text,
+          activityId: context.activity && context.activity.id,
+      });
 
       const actionType = 'FetchInputAdaptiveCard';
       const formData = {};
@@ -77,19 +83,17 @@ class LoopsCommandHandler {
       try {
           let response;
           try {
-              response = await axios.post(BACKEND_URL, payloadJsonString);
-
-              // if entire response/body missing
-              if (!response || !response.data || Object.keys(response.data).length === 0) {
-                console.warn("Empty backend response received");
-                return;
-              }
-
+              response = await postLoops(BACKEND_URL, payloadJsonString);
           } catch (backendError) {
-              console.error("Error with the backend request:", backendError);
+              logger.error("Error with the backend request", {
+                  event: "TEAMS_ACTIVITY_FAILED",
+                  durationMs: elapsedMs(),
+                  error: backendError,
+                  response: backendError && backendError.response && backendError.response.data,
+              });
               const cardJson = getDefaultAdaptiveCard(backendError);
               const errorMessageActivity = MessageFactory.attachment(CardFactory.adaptiveCard(cardJson));
-              await context.sendActivity(errorMessageActivity);
+              await sendTeamsActivity(context, errorMessageActivity);
               throw new Error("Backend request failed.");
           }
           // Extract or default to error message based on backend response.
@@ -97,6 +101,11 @@ class LoopsCommandHandler {
           let hiddenData = response.data.hiddenData;
           if (!response.data.cardJson) {
               const actionType = 'ProcessAdaptiveCardForm';
+              logger.info("Activity classified", {
+                  event: "TEAMS_ACTIVITY_CLASSIFIED",
+                  actionType,
+                  activityId: context.activity && context.activity.id,
+              });
               // Create the payload
               const payload = {
                   ...await constructPayloadForBackend(actionType, formData, context),
@@ -117,7 +126,8 @@ class LoopsCommandHandler {
               const responseAsReply = buttonData.responseAsReply || false;
 
               const payloadJsonString = JSON.stringify(payload);
-              const response = await axios.post(BACKEND_URL, payloadJsonString);
+
+              const response = await postLoops(BACKEND_URL, payloadJsonString);
               await processBackendResponse(response, context, responseAsReply, null);
           } else {
               adaptiveCardJson = JSON.parse(response.data.cardJson);
@@ -130,18 +140,22 @@ class LoopsCommandHandler {
 
           // Update the processing activity with the final response card.
           if (adaptiveCardJson) {
-              await context.sendActivity({
+              await sendTeamsActivity(context, {
                   attachments: [adaptiveCardAttachment]
               });
           }
       } catch (error) {
-          console.error("Error handling the '" + command + "' command:", error);
+          logger.error("Error handling the '" + command + "' command", {
+              event: "TEAMS_ACTIVITY_FAILED",
+              command,
+              error,
+          });
 
           const errorMessage = 'An error occurred while processing your command.';
           const cardJson = getDefaultAdaptiveCard(errorMessage);
           const errorMessageActivity = MessageFactory.attachment(CardFactory.adaptiveCard(cardJson));
 
-          await context.sendActivity(errorMessageActivity);
+          await sendTeamsActivity(context, errorMessageActivity);
       }
   }
 
@@ -153,6 +167,29 @@ class LoopsCommandHandler {
       const {
           activity
       } = context;
+
+      try {
+          noteActivity(activity, { suppress: false });
+      } catch (error) {
+          logger.error("Duplicate observation failed", {
+              event: "TEAMS_ACTIVITY_FAILED",
+              error,
+          });
+      }
+
+      logger.info("Command invoke received", {
+          event: "TEAMS_ACTIVITY_RECEIVED",
+          activityType: activity && activity.type,
+          activityName: activity && activity.name,
+          value: activity && activity.value,
+          activityId: activity && activity.id,
+      });
+      logger.info("Activity classified", {
+          event: "TEAMS_ACTIVITY_CLASSIFIED",
+          actionType: activity && activity.name,
+          value: activity && activity.value,
+          activityId: activity && activity.id,
+      });
 
       // Case when the user opens a task module.
       if (activity.name === 'task/fetch') {
@@ -188,14 +225,14 @@ class LoopsCommandHandler {
               $schema: "http://adaptivecards.io/schemas/adaptive-card.json"
           };
           const thankYouActivity = MessageFactory.attachment(CardFactory.adaptiveCard(thankYouCard));
-          await context.sendActivity(thankYouActivity);
+          await sendTeamsActivity(context, thankYouActivity);
       }
       // Default case for unknown invoke actions.
       else {
           const errorMessage = 'Unknown or unsupported invoke action.';
           const cardJson = getDefaultAdaptiveCard(errorMessage);
           const errorMessageActivity = MessageFactory.attachment(CardFactory.adaptiveCard(cardJson));
-          await context.sendActivity(errorMessageActivity);
+          await sendTeamsActivity(context, errorMessageActivity);
       }
   }
 }
@@ -218,7 +255,7 @@ async function constructPayloadForBackend(actionType, data, context) {
           teamName = teamDetails.name;
           teamId = teamDetails.aadGroupId;
       } catch (err) {
-          console.error("Error fetching team details:", err);
+          logConnectorError("Error fetching team details", err);
           teamName = "Unknown"; // Or any other default value.
       }
   } else {
@@ -303,7 +340,10 @@ function loadCommandsFromManifest() {
 
       return botCommands.map(cmd => cmd.title);
   } catch (error) {
-      console.error('Error loading commands from manifest:', error);
+      logger.error("Error loading commands from manifest", {
+          event: "TEAMS_ACTIVITY_FAILED",
+          error,
+      });
       return []; // Return an empty array or handle the error as needed
   }
 }
@@ -318,7 +358,12 @@ async function processBackendResponse(response, context, responseAsReply, activi
   try {
       // Check if backend response indicates successful processing.
       if (response.data.status === "ok") {
-          console.log("Backend response:", response.data);
+          logger.info("Backend response", {
+              event: "LOOPS_WEBHOOK_SUCCEEDED",
+              processingStatus: "webhook_accepted",
+              durationMs: elapsedMs(),
+              response: response.data,
+          });
 
           // If there's card JSON data in the response, create an adaptive card.
           if (response.data && response.data.cardJson) {
@@ -327,13 +372,13 @@ async function processBackendResponse(response, context, responseAsReply, activi
               // If action type is not for fetching input, display card.
               if (response.data.actionType !== 'FetchInputAdaptiveCard') {
                   if (responseAsReply) {
-                      await context.sendActivity({
+                      await sendTeamsActivity(context, {
                           type: 'message',
                           id: activityId,
                           attachments: [card]
                       });
                   } else {
-                      await context.updateActivity({
+                      await updateTeamsActivity(context, {
                           type: 'message',
                           id: activityId,
                           attachments: [card]
@@ -344,13 +389,13 @@ async function processBackendResponse(response, context, responseAsReply, activi
           // If there's a message in the response, send it.
           else if (response.data && response.data.message) {
               if (responseAsReply) {
-                  await context.sendActivity({
+                  await sendTeamsActivity(context, {
                       type: 'message',
                       id: context.activity.replyToId,
                       text: response.data.message
                   });
               } else {
-                  await context.updateActivity({
+                  await updateTeamsActivity(context, {
                       type: 'message',
                       id: context.activity.replyToId,
                       text: response.data.message
@@ -360,10 +405,17 @@ async function processBackendResponse(response, context, responseAsReply, activi
       }
       // If backend response indicates an error, log it and inform the user.
       else {
+          logger.error("Backend response was not ok", {
+              event: "LOOPS_WEBHOOK_FAILED",
+              processingStatus: "webhook_failed",
+              durationMs: elapsedMs(),
+              response: response.data,
+              activityId: context.activity && context.activity.id,
+          });
           const defaultCardJson = getDefaultAdaptiveCard(response.data.cardJson);
           const card = CardFactory.adaptiveCard(defaultCardJson);
           if (responseAsReply) {
-              await context.sendActivity({
+              await sendTeamsActivity(context, {
                   type: 'message',
                   id: context.activity.replyToId,
                   attachments: [card],
@@ -384,7 +436,7 @@ async function processBackendResponse(response, context, responseAsReply, activi
                   }
               });
           } else {
-              await context.updateActivity({
+              await updateTeamsActivity(context, {
                   type: 'message',
                   id: context.activity.replyToId,
                   attachments: [card],
@@ -407,8 +459,12 @@ async function processBackendResponse(response, context, responseAsReply, activi
           }
       }
   } catch (error) {
-      console.error('Error processing the backend response:', error);
-      await context.updateActivity({
+      logger.error("Error processing the backend response", {
+          event: "TEAMS_ACTIVITY_FAILED",
+          durationMs: elapsedMs(),
+          error,
+      });
+      await updateTeamsActivity(context, {
           type: 'message', // Activity type
           id: context.activity.replyToId, // ID of the activity to be updated
           text: 'An unexpected error occurred. Please try again later.' // New text to replace the previous message
